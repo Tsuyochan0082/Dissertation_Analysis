@@ -1,0 +1,255 @@
+---
+title: "02 Phase 1: National Analysis"
+author: "Tsuyoshi Choh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+This file conducts the national-scale analysis for Phase 1:
+
+1. LA-level ranking by composite disadvantage score
+2. Study area selection (South Yorkshire)
+3. Global Moran's I (spatial autocorrelation)
+4. England-wide maps
+
+---
+
+## 1. Load Libraries and Data
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(ggplot2)
+library(scales)
+
+cleaned_access_final <- readRDS("data/processed/cleaned_access_final.rds")
+lsoa_map             <- readRDS("data/processed/lsoa_map.rds")
+
+cat("cleaned_access_final:", nrow(cleaned_access_final), "rows\n")
+cat("lsoa_map:", nrow(lsoa_map), "rows\n")
+```
+
+---
+
+## 2. LA-level Ranking
+
+### 2.1 All LAs
+
+```{r la-ranking-all}
+la_ranking_all <- cleaned_access_final %>%
+  group_by(la_name) %>%
+  summarise(
+    total_lsoa        = n(),
+    mean_composite    = mean(composite_score,   na.rm = TRUE),
+    mean_deprivation  = mean(deprivation_score, na.rm = TRUE),
+    mean_accessibility = mean(cumulative_score,  na.rm = TRUE),
+    mean_inactivity   = mean(inactive_rate,     na.rm = TRUE)
+  ) %>%
+  arrange(desc(mean_composite))
+
+head(la_ranking_all, 20)
+```
+
+### 2.2 Urban LAs Only (UN1 + UF1, 100+ LSOAs)
+
+```{r la-ranking-urban}
+la_ranking_urban <- cleaned_access_final %>%
+  filter(RUC21CD %in% c("UN1", "UF1")) %>%
+  group_by(la_name) %>%
+  summarise(
+    total_lsoa        = n(),
+    mean_composite    = mean(composite_score,   na.rm = TRUE),
+    mean_deprivation  = mean(deprivation_score, na.rm = TRUE),
+    mean_accessibility = mean(cumulative_score,  na.rm = TRUE),
+    mean_inactivity   = mean(inactive_rate,     na.rm = TRUE)
+  ) %>%
+  filter(total_lsoa >= 100) %>%
+  arrange(desc(mean_composite))
+
+print(la_ranking_urban, n = 20)
+```
+
+### 2.3 South Yorkshire Position in Ranking
+
+```{r sy-position}
+sy_las <- c("Barnsley", "Doncaster", "Rotherham", "Sheffield")
+
+la_ranking_urban %>%
+  mutate(rank = row_number()) %>%
+  filter(la_name %in% sy_las) %>%
+  select(rank, la_name, total_lsoa, mean_composite, mean_inactivity)
+```
+
+---
+
+## 3. Global Moran's I
+
+### 3.1 Build Spatial Weights Matrix
+
+```{r spatial-weights}
+lsoa_map_clean <- lsoa_map %>%
+  filter(!is.na(composite_score) & !is.na(inactive_rate))
+
+lsoa_sp  <- as(lsoa_map_clean, "Spatial")
+neighbors <- poly2nb(lsoa_sp, queen = TRUE)
+weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+cat("Spatial weights built for", nrow(lsoa_map_clean), "LSOAs\n")
+```
+
+### 3.2 Moran's I: Composite Score
+
+```{r morans-i-composite}
+moran_composite <- moran.test(
+  as.numeric(lsoa_map_clean$composite_score),
+  weights,
+  zero.policy = TRUE,
+  na.action = na.omit
+)
+
+print(moran_composite)
+```
+
+### 3.3 Moran's I: Economic Inactivity Rate
+
+```{r morans-i-inactivity}
+moran_inactivity <- moran.test(
+  as.numeric(lsoa_map_clean$inactive_rate),
+  weights,
+  zero.policy = TRUE,
+  na.action = na.omit
+)
+
+print(moran_inactivity)
+```
+
+---
+
+## 4. England-wide Maps
+
+### 4.1 Composite Disadvantage Score
+
+```{r map-composite}
+ggplot(lsoa_map) +
+  geom_sf(aes(fill = composite_score), color = NA) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    direction = -1,
+    name = "Composite\nDisadvantage",
+    na.value = "grey80"
+  ) +
+  labs(
+    title = "Composite Disadvantage Score by LSOA",
+    subtitle = "England 2021 (n = 31,810)"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+ggsave("data/processed/map_composite_england.png", width = 10, height = 12, dpi = 300)
+```
+
+### 4.2 High Disadvantage LSOAs with South Yorkshire Highlighted
+
+```{r map-high-disadvantage}
+# Threshold: top 10% urban LSOAs
+threshold_urban <- cleaned_access_final %>%
+  filter(RUC21CD %in% c("UN1", "UF1")) %>%
+  pull(composite_score) %>%
+  quantile(0.9, na.rm = TRUE)
+
+lsoa_map <- lsoa_map %>%
+  mutate(
+    high_disadvantage  = composite_score >= threshold_urban & RUC21CD %in% c("UN1", "UF1"),
+    is_south_yorkshire = str_detect(LSOA21NM, "Barnsley|Doncaster|Rotherham|Sheffield")
+  )
+
+# South Yorkshire boundary
+south_yorks_boundary <- lsoa_map %>%
+  filter(is_south_yorkshire) %>%
+  st_union()
+
+ggplot(lsoa_map) +
+  geom_sf(fill = "grey90", color = NA) +
+  geom_sf(
+    data = lsoa_map %>% filter(high_disadvantage == TRUE),
+    fill = "#d62728", color = NA, alpha = 0.8
+  ) +
+  geom_sf(data = south_yorks_boundary, fill = NA, color = "black", linewidth = 0.4) +
+  labs(
+    title    = "High Disadvantage LSOAs — England",
+    subtitle = "Top 10% urban LSOAs by composite score. South Yorkshire outlined."
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+ggsave("data/processed/map_high_disadvantage_england.png", width = 10, height = 12, dpi = 300)
+```
+
+### 4.3 Economic Inactivity Rate
+
+```{r map-inactivity}
+ggplot(lsoa_map) +
+  geom_sf(aes(fill = inactive_rate), color = NA) +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    name = "Inactivity\nRate",
+    na.value = "grey80",
+    labels = percent_format()
+  ) +
+  labs(
+    title    = "Economic Inactivity Rate by LSOA",
+    subtitle = "England 2021 (n = 31,810)"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+ggsave("data/processed/map_inactivity_england.png", width = 10, height = 12, dpi = 300)
+```
+
+---
+
+## 5. Correlation Check
+
+```{r correlation}
+cor_overall <- cor(
+  cleaned_access_final$composite_score,
+  cleaned_access_final$inactive_rate,
+  use = "complete.obs"
+)
+
+cat("Correlation (composite vs inactivity, England):", round(cor_overall, 3), "\n")
+
+# By urban/rural
+cleaned_access_final %>%
+  mutate(urban_rural = ifelse(RUC21CD %in% c("UN1", "UF1"), "Urban", "Rural")) %>%
+  group_by(urban_rural) %>%
+  summarise(
+    n           = n(),
+    correlation = cor(composite_score, inactive_rate, use = "complete.obs")
+  )
+```
+
+---
+
+## 6. Save Updated lsoa_map
+
+```{r save}
+saveRDS(lsoa_map, "data/processed/lsoa_map.rds")
+cat("lsoa_map updated and saved\n")
+```
