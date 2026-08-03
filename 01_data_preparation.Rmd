@@ -7,14 +7,9 @@ output: html_document
 
 # Overview
 
-This file loads, cleans, and merges all raw data sources required for the dissertation analysis. The output is two cleaned datasets saved as RDS files:
+This file prepares the England-wide dataset, the UN1 main analytical sample, and the UN1 + UF1 sensitivity sample.
 
-- `cleaned_access_final.rds`: LSOA-level analytical dataset (n = 31,810)
-- `lsoa_map.rds`: Spatial dataset with shapefile geometry
-
----
-
-## 1. Load Libraries
+## 1. Setup
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(tidyverse)
@@ -23,214 +18,247 @@ library(janitor)
 library(scales)
 library(sf)
 library(stringr)
+
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+mean_or_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+assert_unique <- function(data, key, object_name) {
+  duplicated_keys <- data %>%
+    count(.data[[key]], name = "n") %>%
+    filter(n > 1)
+
+  if (nrow(duplicated_keys) > 0) {
+    stop(object_name, " contains duplicate values in ", key)
+  }
+}
+
+inverse_rescale <- function(x) {
+  valid_range <- range(x, na.rm = TRUE)
+  if (!all(is.finite(valid_range)) || diff(valid_range) == 0) {
+    stop("Cannot rescale a variable with no finite variation.")
+  }
+  1 - scales::rescale(x, to = c(0, 1), from = valid_range)
+}
 ```
 
----
+## 2. Load raw data
 
-## 2. Load Raw Data
+```{r load-data}
+lookup <- read_csv(
+  "data/raw/LSOA_2011_2021_lookup.csv",
+  show_col_types = FALSE
+)
 
-### 2.1 LSOA 2011 to 2021 Lookup
-
-```{r load-lookup}
-lookup <- read_csv("data/raw/LSOA_2011_2021_lookup.csv")
-```
-
-### 2.2 Economic Inactivity (Census 2021, TS066)
-
-```{r load-economic}
 economic <- read_csv(
   "data/raw/economic_inactivity_LSOA_2021.csv",
   skip = 7,
   show_col_types = FALSE
 )
-```
 
-### 2.3 Index of Multiple Deprivation 2019 (File 2)
-
-```{r load-imd}
 imd <- read_excel(
   "data/raw/IMD2019_File2_DomainScores.xlsx",
   sheet = 2
 )
-```
 
-### 2.4 GB Accessibility Indicators (PT)
-
-```{r load-accessibility}
-emp_pt <- read_csv("data/raw/accessibility_all/accessibility/employment/access_employment_pt.csv") %>%
+emp_pt <- read_csv(
+  "data/raw/accessibility_all/accessibility/employment/access_employment_pt.csv",
+  show_col_types = FALSE
+) %>%
   filter(str_starts(geo_code, "E")) %>%
   select(geo_code, employment_45, employment_pct_45)
 
-gp_pt <- read_csv("data/raw/accessibility_all/accessibility/gp/access_gp_pt.csv") %>%
+gp_pt <- read_csv(
+  "data/raw/accessibility_all/accessibility/gp/access_gp_pt.csv",
+  show_col_types = FALSE
+) %>%
   filter(str_starts(geo_code, "E")) %>%
   select(geo_code, gp_number_45, gp_pct_45)
 
-supermarket_pt <- read_csv("data/raw/accessibility_all/accessibility/supermarket/access_supermarkets_pt.csv") %>%
+supermarket_pt <- read_csv(
+  "data/raw/accessibility_all/accessibility/supermarket/access_supermarkets_pt.csv",
+  show_col_types = FALSE
+) %>%
   filter(str_starts(geo_code, "E")) %>%
   select(geo_code, supermarket_45, supermarket_pct_45)
-```
 
-### 2.5 GB Accessibility Indicators (Car)
-
-```{r load-car}
-emp_car <- read_csv("data/raw/accessibility_all/accessibility/employment/access_employment_car.csv") %>%
+# Appendix variable only.
+emp_car <- read_csv(
+  "data/raw/accessibility_all/accessibility/employment/access_employment_car.csv",
+  show_col_types = FALSE
+) %>%
   filter(str_starts(geo_code, "E")) %>%
   select(geo_code, employment_45_car = employment_45)
-```
 
-### 2.6 Rural Urban Classification 2021
-
-```{r load-ruc}
-ruc <- read_csv("data/raw/RUC_Data.csv") %>%
+ruc <- read_csv(
+  "data/raw/RUC_Data.csv",
+  show_col_types = FALSE
+) %>%
   select(LSOA21CD, RUC21CD, RUC21NM)
+
+lsoa_sf <- st_read(
+  "data/raw/Dissertation_shpfile/",
+  quiet = TRUE
+) %>%
+  filter(str_starts(LSOA21CD, "E")) %>%
+  st_make_valid()
+
+assert_unique(emp_pt, "geo_code", "Employment PT data")
+assert_unique(gp_pt, "geo_code", "GP PT data")
+assert_unique(supermarket_pt, "geo_code", "Supermarket PT data")
+assert_unique(emp_car, "geo_code", "Employment car data")
+assert_unique(ruc, "LSOA21CD", "RUC data")
+assert_unique(st_drop_geometry(lsoa_sf), "LSOA21CD", "LSOA shapefile")
 ```
 
-### 2.7 LSOA Shapefile
-
-```{r load-shapefile}
-lsoa_sf <- st_read("data/raw/Dissertation_shpfile/")
-```
-
----
-
-## 3. Link IMD 2019 to 2021 Boundaries
-
-IMD 2019 uses 2011 LSOA boundaries. We use the ONS lookup to convert to 2021 boundaries. Where one 2011 LSOA maps to multiple 2021 LSOAs, IMD scores are averaged.
+## 3. Reconcile IMD 2019 with 2021 LSOAs
 
 ```{r imd-link}
 imd_2021 <- imd %>%
   left_join(lookup, by = c("LSOA code (2011)" = "LSOA11CD")) %>%
   clean_names() %>%
+  filter(!is.na(lsoa21cd)) %>%
   group_by(lsoa21cd) %>%
   summarise(
-    la_name           = first(lad22nm),
-    income_rank       = mean(income_rank_where_1_is_most_deprived, na.rm = TRUE),
-    income_decile     = mean(income_decile_where_1_is_most_deprived_10_percent_of_lso_as, na.rm = TRUE),
-    education_rank    = mean(education_skills_and_training_rank_where_1_is_most_deprived, na.rm = TRUE),
-    education_decile  = mean(education_skills_and_training_decile_where_1_is_most_deprived_10_percent_of_lso_as, na.rm = TRUE),
-    employment_rank   = mean(employment_rank_where_1_is_most_deprived, na.rm = TRUE),
-    employment_decile = mean(employment_decile_where_1_is_most_deprived_10_percent_of_lso_as, na.rm = TRUE),
-    imd_rank          = mean(index_of_multiple_deprivation_imd_rank_where_1_is_most_deprived, na.rm = TRUE),
-    imd_decile        = mean(index_of_multiple_deprivation_imd_decile_where_1_is_most_deprived_10_percent_of_lso_as, na.rm = TRUE)
-  ) %>%
-  ungroup()
+    la_name_lookup = {
+      values <- lad22nm[!is.na(lad22nm)]
+      if (length(values) == 0) NA_character_ else values[[1]]
+    },
+    income_rank = mean_or_na(
+      income_rank_where_1_is_most_deprived
+    ),
+    income_decile = mean_or_na(
+      income_decile_where_1_is_most_deprived_10_percent_of_lso_as
+    ),
+    education_rank = mean_or_na(
+      education_skills_and_training_rank_where_1_is_most_deprived
+    ),
+    education_decile = mean_or_na(
+      education_skills_and_training_decile_where_1_is_most_deprived_10_percent_of_lso_as
+    ),
+    employment_rank = mean_or_na(
+      employment_rank_where_1_is_most_deprived
+    ),
+    employment_decile = mean_or_na(
+      employment_decile_where_1_is_most_deprived_10_percent_of_lso_as
+    ),
+    imd_rank = mean_or_na(
+      index_of_multiple_deprivation_imd_rank_where_1_is_most_deprived
+    ),
+    imd_decile = mean_or_na(
+      index_of_multiple_deprivation_imd_decile_where_1_is_most_deprived_10_percent_of_lso_as
+    ),
+    .groups = "drop"
+  )
 
-nrow(imd_2021)
+assert_unique(imd_2021, "lsoa21cd", "IMD 2021-linked data")
 ```
 
-
----
-
-## 4. Merge All Datasets
+## 4. Merge datasets
 
 ```{r merge}
-# Clean economic inactivity data
 economic_clean <- economic %>%
   clean_names() %>%
   select(
     lsoa21_code = mnemonic,
-    lsoa_name   = area,
+    lsoa_name = area,
     total_16_plus = total_all_usual_residents_aged_16_years_and_over,
     inactive_total = economically_inactive,
     inactive_longterm_sick = economically_inactive_long_term_sick_or_disabled
   ) %>%
-  distinct(lsoa21_code, .keep_all = TRUE) %>% 
+  distinct(lsoa21_code, .keep_all = TRUE) %>%
   mutate(
-    inactive_rate      = inactive_total / total_16_plus,
+    inactive_rate = inactive_total / total_16_plus,
     longterm_sick_rate = inactive_longterm_sick / total_16_plus,
     la_name = lsoa_name %>%
       str_remove("^lsoa2021:") %>%
-      str_remove("\\s+\\d+[A-Z]+$")
+      str_remove("\\s+\\d+[A-Z]+$") %>%
+      str_squish()
   )
 
-# Merge all
+assert_unique(economic_clean, "lsoa21_code", "Economic inactivity data")
+
 cleaned_access_final <- economic_clean %>%
-  left_join(imd_2021,      by = c("lsoa21_code" = "lsoa21cd")) %>%
-  left_join(emp_pt,        by = c("lsoa21_code" = "geo_code")) %>%
-  left_join(gp_pt,         by = c("lsoa21_code" = "geo_code")) %>%
-  left_join(supermarket_pt,by = c("lsoa21_code" = "geo_code")) %>%
-  left_join(emp_car,       by = c("lsoa21_code" = "geo_code")) %>%
-  left_join(ruc,           by = c("lsoa21_code" = "LSOA21CD")) %>%
+  left_join(imd_2021, by = c("lsoa21_code" = "lsoa21cd")) %>%
+  left_join(emp_pt, by = c("lsoa21_code" = "geo_code")) %>%
+  left_join(gp_pt, by = c("lsoa21_code" = "geo_code")) %>%
+  left_join(supermarket_pt, by = c("lsoa21_code" = "geo_code")) %>%
+  left_join(emp_car, by = c("lsoa21_code" = "geo_code")) %>%
+  left_join(ruc, by = c("lsoa21_code" = "LSOA21CD")) %>%
+  mutate(
+    la_name = coalesce(la_name_lookup, la_name)
+  ) %>%
+  select(-la_name_lookup) %>%
+  # Retain the common England-wide accessibility coverage used in the study.
   filter(!is.na(employment_45))
 
-dim(cleaned_access_final)
+assert_unique(cleaned_access_final, "lsoa21_code", "Merged England dataset")
+cat("Merged England-wide accessibility dataset:", nrow(cleaned_access_final), "LSOAs\n")
 ```
 
----
+## 5. Construct scores
 
-## 5. Construct Composite Disadvantage Score
-
-```{r composite-score}
-# la_name重複を解消
-cleaned_access_final <- cleaned_access_final %>%
-  select(-la_name.x) %>%
-  rename(la_name = la_name.y)
-
-# Composite score構築
+```{r scores}
 cleaned_access_final <- cleaned_access_final %>%
   mutate(
-    income_score      = 1 - rescale(income_decile),
-    education_score   = 1 - rescale(education_decile),
+    income_score = inverse_rescale(income_decile),
+    education_score = inverse_rescale(education_decile),
     deprivation_score = (income_score + education_score) / 2,
-    emp_score         = 1 - rescale(log1p(employment_45)),
-    gp_score          = 1 - rescale(log1p(gp_number_45)),
-    supermarket_score = 1 - rescale(log1p(supermarket_45)),
-    cumulative_score  = (emp_score + gp_score + supermarket_score) / 3,
-    composite_score   = (deprivation_score + cumulative_score) / 2,
-    pt_car_gap        = employment_45_car - employment_45
+
+    emp_score = inverse_rescale(log1p(employment_45)),
+    gp_score = inverse_rescale(log1p(gp_number_45)),
+    supermarket_score = inverse_rescale(log1p(supermarket_45)),
+
+    mean_access_disadvantage =
+      (emp_score + gp_score + supermarket_score) / 3,
+
+    combined_area_disadvantage =
+      (deprivation_score + mean_access_disadvantage) / 2,
+
+    # Appendix variable only.
+    pt_car_gap = employment_45_car - employment_45
   )
-
-summary(cleaned_access_final %>% select(deprivation_score, cumulative_score, composite_score, inactive_rate))
 ```
 
----
+## 6. Analytical samples and low-accessibility dimensions
 
-## 6. Create Spatial Dataset
+```{r samples-and-thresholds}
+main_required <- c(
+  "la_name", "inactive_rate",
+  "employment_45", "gp_number_45", "supermarket_45",
+  "emp_score", "gp_score", "supermarket_score"
+)
 
-```{r spatial}
-lsoa_map <- lsoa_sf %>%
-  filter(str_starts(LSOA21CD, "E")) %>%
-  left_join(
-    cleaned_access_final %>%
-      select(lsoa21_code, la_name, inactive_rate, longterm_sick_rate,
-             composite_score, deprivation_score, cumulative_score,
-             emp_score, gp_score, supermarket_score,
-             employment_45, employment_45_car, pt_car_gap,
-             RUC21CD, RUC21NM),
-    by = c("LSOA21CD" = "lsoa21_code")
+un1_base <- cleaned_access_final %>%
+  filter(RUC21CD == "UN1") %>%
+  drop_na(all_of(main_required))
+
+un1_uf1_base <- cleaned_access_final %>%
+  filter(RUC21CD %in% c("UN1", "UF1")) %>%
+  drop_na(all_of(main_required))
+
+thr_emp_un1 <- quantile(un1_base$emp_score, 0.75, na.rm = TRUE, type = 7)
+thr_gp_un1 <- quantile(un1_base$gp_score, 0.75, na.rm = TRUE, type = 7)
+thr_sup_un1 <- quantile(un1_base$supermarket_score, 0.75, na.rm = TRUE, type = 7)
+
+thr_emp_sens <- quantile(un1_uf1_base$emp_score, 0.75, na.rm = TRUE, type = 7)
+thr_gp_sens <- quantile(un1_uf1_base$gp_score, 0.75, na.rm = TRUE, type = 7)
+thr_sup_sens <- quantile(un1_uf1_base$supermarket_score, 0.75, na.rm = TRUE, type = 7)
+
+thresholds <- list(
+  main_un1 = c(
+    employment = unname(thr_emp_un1),
+    gp = unname(thr_gp_un1),
+    supermarket = unname(thr_sup_un1)
+  ),
+  sensitivity_un1_uf1 = c(
+    employment = unname(thr_emp_sens),
+    gp = unname(thr_gp_sens),
+    supermarket = unname(thr_sup_sens)
   )
+)
 
-nrow(lsoa_map)
-```
-
----
-
-## 7. Validation Checks
-
-```{r validation}
-# Check n
-cat("cleaned_access_final rows:", nrow(cleaned_access_final), "\n")
-cat("lsoa_map rows:", nrow(lsoa_map), "\n")
-
-# Check NA counts
-cat("\nNA counts in key variables:\n")
-cleaned_access_final %>%
-  select(inactive_rate, composite_score, deprivation_score, cumulative_score) %>%
-  summarise(across(everything(), ~sum(is.na(.)))) %>%
-  print()
-
-# Check score distributions
-cat("\nComposite score summary:\n")
-summary(cleaned_access_final$composite_score)
-```
-
----
-
-## 8. Save Outputs
-
-```{r save}
-saveRDS(cleaned_access_final, "data/processed/cleaned_access_final.rds")
-saveRDS(lsoa_map,             "data/processed/lsoa_map.rds")
-
-cat("Saved cleaned_access_final.rds and lsoa_map.rds\n")
+print(thresholds)
 ```
