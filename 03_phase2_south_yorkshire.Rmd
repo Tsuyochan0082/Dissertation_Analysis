@@ -1,5 +1,5 @@
 ---
-title: "03 Phase 2: South Yorkshire Case Study"
+title: "03 Phase 2: County Durham Case Study"
 author: "Tsuyoshi Choh"
 date: "`r Sys.Date()`"
 output: html_document
@@ -7,17 +7,9 @@ output: html_document
 
 # Overview
 
-This file conducts the South Yorkshire case study analysis for Phase 2:
+This file performs the County Durham within-area analysis using the same 0-3 low-accessibility measure as Phase 1.
 
-1. South Yorkshire LSOA extraction
-2. Comparative analysis (3 disadvantage groups)
-3. PT vs Car accessibility gap
-4. LISA (local spatial autocorrelation / anomaly detection)
-5. Maps
-
----
-
-## 1. Load Libraries and Data
+## 1. Setup and extraction
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(tidyverse)
@@ -25,431 +17,357 @@ library(sf)
 library(spdep)
 library(ggplot2)
 library(scales)
-library(patchwork)
 
-cleaned_access_final <- readRDS("data/processed/cleaned_access_final.rds")
-lsoa_map             <- readRDS("data/processed/lsoa_map.rds")
-```
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
 
----
+lsoa_map <- readRDS("data/processed/lsoa_map.rds")
+un1_analytic <- readRDS("data/processed/un1_analytic.rds")
+un1_uf1_analytic <- readRDS("data/processed/un1_uf1_analytic.rds")
+selected_case_las <- readRDS("data/processed/selected_case_las.rds")
 
-## 2. Extract South Yorkshire LSOAs
+if (length(selected_case_las) != 1 || selected_case_las != "County Durham") {
+  stop("The selected case must be County Durham. Re-run the final Phase 1 file.")
+}
 
-```{r sy-extract}
-sy_las <- c("Barnsley", "Doncaster", "Rotherham", "Sheffield")
-
-sy_data <- cleaned_access_final %>%
-  filter(la_name %in% sy_las)
-
-sy_map <- lsoa_map %>%
-  filter(str_detect(LSOA21NM, "Barnsley|Doncaster|Rotherham|Sheffield"))
-
-cat("South Yorkshire LSOAs:", nrow(sy_data), "\n")
-cat("By LA:\n")
-sy_data %>% count(la_name) %>% print()
-```
-
----
-
-## 3. Comparative Analysis — 3 Disadvantage Groups
-
-### 3.1 Define Groups
-
-LSOAs are classified into three groups based on the number of accessibility dimensions where they fall in the worst quartile:
-
-- **No disadvantage**: not in worst quartile on any dimension
-- **Single disadvantage**: worst quartile on exactly one dimension
-- **Cumulative disadvantage**: worst quartile on two or more dimensions
-
-```{r group-classification}
-# Thresholds: worst quartile (75th percentile) for each accessibility score
-q75_emp   <- quantile(cleaned_access_final$emp_score,         0.75, na.rm = TRUE)
-q75_gp    <- quantile(cleaned_access_final$gp_score,          0.75, na.rm = TRUE)
-q75_super <- quantile(cleaned_access_final$supermarket_score, 0.75, na.rm = TRUE)
-
-sy_data <- sy_data %>%
-  mutate(
-    disadv_emp   = emp_score         >= q75_emp,
-    disadv_gp    = gp_score          >= q75_gp,
-    disadv_super = supermarket_score >= q75_super,
-    n_disadvantaged = disadv_emp + disadv_gp + disadv_super,
-    disadvantage_group = case_when(
-      n_disadvantaged == 0 ~ "No disadvantage",
-      n_disadvantaged == 1 ~ "Single disadvantage",
-      n_disadvantaged >= 2 ~ "Cumulative disadvantage"
-    ),
-    disadvantage_group = factor(
-      disadvantage_group,
-      levels = c("No disadvantage", "Single disadvantage", "Cumulative disadvantage")
+summarise_dose_response <- function(data, group_var) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarise(
+      n = n(),
+      mean_inactivity = mean(inactive_rate),
+      median_inactivity = median(inactive_rate),
+      sd_inactivity = sd(inactive_rate),
+      se = sd_inactivity / sqrt(n),
+      t_critical = qt(0.975, df = n - 1),
+      ci_lower = mean_inactivity - t_critical * se,
+      ci_upper = mean_inactivity + t_critical * se,
+      .groups = "drop"
     )
-  )
+}
 
-sy_data %>% count(disadvantage_group)
+case_data <- un1_analytic %>%
+  filter(la_name == selected_case_las)
+
+case_attributes <- case_data %>%
+  rename(LSOA21CD = lsoa21_code)
+
+case_map <- lsoa_map %>%
+  select(LSOA21CD, geometry) %>%
+  inner_join(case_attributes, by = "LSOA21CD") %>%
+  st_make_valid()
+
+case_boundary <- lsoa_map %>%
+  filter(la_name == selected_case_las) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  st_make_valid()
+
+stopifnot(
+  nrow(case_data) > 0,
+  nrow(case_map) == nrow(case_data),
+  n_distinct(case_map$LSOA21CD) == nrow(case_map),
+  !st_is_empty(case_boundary)
+)
+
+cat("Selected case:", selected_case_las, "\n")
+cat("UN1 complete-case LSOAs:", nrow(case_data), "\n")
 ```
 
-### 3.2 Compare Inactivity Rates Across Groups
+## 2. Internal distribution
 
-```{r group-comparison}
-group_summary <- sy_data %>%
-  group_by(disadvantage_group) %>%
-  summarise(
-    n              = n(),
-    mean_inactivity = mean(inactive_rate, na.rm = TRUE),
-    median_inactivity = median(inactive_rate, na.rm = TRUE),
-    sd_inactivity  = sd(inactive_rate, na.rm = TRUE)
-  )
+```{r internal-distribution}
+case_internal_distribution <- case_data %>%
+  count(n_low_access_dimensions, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
 
-print(group_summary)
+print(case_internal_distribution)
+
+case_dimension_combinations <- case_data %>%
+  count(
+    low_employment_accessibility,
+    low_gp_accessibility,
+    low_supermarket_accessibility,
+    name = "n"
+  ) %>%
+  arrange(desc(n))
+
+print(case_dimension_combinations)
 ```
 
-### 3.3 Visualise
+## 3. County Durham maps
 
-```{r group-boxplot}
-ggplot(sy_data, aes(x = disadvantage_group, y = inactive_rate, fill = disadvantage_group)) +
-  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
-  scale_fill_manual(values = c("grey70", "#f0a500", "#d62728")) +
-  scale_y_continuous(labels = percent_format()) +
-  labs(
-    title    = "Economic Inactivity Rate by Disadvantage Group",
-    subtitle = "South Yorkshire LSOAs",
-    x        = NULL,
-    y        = "Inactivity Rate"
+```{r map-dimensions}
+ggplot() +
+  geom_sf(
+    data = case_boundary,
+    fill = "grey95",
+    color = "grey40",
+    linewidth = 0.4
   ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "none")
-
-ggsave("data/processed/sy_group_boxplot.png", width = 9, height = 6, dpi = 300)
-```
-
----
-
-## 4. PT vs Car Accessibility Gap
-
-### 4.1 Summary Statistics
-
-```{r pt-car-summary}
-sy_data %>%
-  summarise(
-    mean_pt    = mean(employment_45,     na.rm = TRUE),
-    mean_car   = mean(employment_45_car, na.rm = TRUE),
-    mean_gap   = mean(pt_car_gap,        na.rm = TRUE),
-    ratio      = mean(employment_45_car, na.rm = TRUE) / mean(employment_45, na.rm = TRUE)
-  )
-```
-
-### 4.2 Map: PT vs Car Gap
-
-```{r map-pt-car-gap}
-sy_map <- lsoa_map %>%
-  filter(str_detect(LSOA21NM, "Barnsley|Doncaster|Rotherham|Sheffield")) %>%
-  left_join(
-    sy_data %>% select(lsoa21_code, disadvantage_group),
-    by = c("LSOA21CD" = "lsoa21_code")
-  )
-
-ggplot(sy_map) +
-  geom_sf(aes(fill = pt_car_gap), color = NA) +
-  scale_fill_viridis_c(
-    option    = "plasma",
+  geom_sf(
+    data = case_map,
+    aes(fill = n_low_access_dimensions),
+    color = "white",
+    linewidth = 0.05
+  ) +
+  scale_fill_viridis_d(
+    option = "plasma",
     direction = -1,
-    name      = "PT vs Car\nGap",
-    na.value  = "grey80"
+    name = "Low-accessibility\ndimensions",
+    drop = FALSE
   ) +
   labs(
-    title    = "PT vs Car Employment Accessibility Gap",
-    subtitle = "South Yorkshire LSOAs — higher values indicate greater car advantage"
+    title = "Number of Low-accessibility Dimensions in County Durham",
+    subtitle = "Coloured areas are UN1 complete-case LSOAs; grey areas are outside the main sample"
   ) +
-  theme_void(base_size = 13) +
+  theme_void(base_size = 12) +
   theme(
-    plot.background = element_rect(fill = "white"),
-    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
     plot.subtitle = element_text(hjust = 0.5)
   )
 
-ggsave("data/processed/sy_map_pt_car_gap.png", width = 10, height = 8, dpi = 300)
+ggsave(
+  "data/processed/county_durham_low_access_dimensions.png",
+  width = 9,
+  height = 7,
+  dpi = 300
+)
 ```
 
----
+```{r map-inactivity}
+ggplot() +
+  geom_sf(
+    data = case_boundary,
+    fill = "grey95",
+    color = "grey40",
+    linewidth = 0.4
+  ) +
+  geom_sf(
+    data = case_map,
+    aes(fill = inactive_rate),
+    color = "white",
+    linewidth = 0.05
+  ) +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    name = "Economic inactivity",
+    labels = percent_format()
+  ) +
+  labs(
+    title = "Economic Inactivity Rate in County Durham",
+    subtitle = "UN1 complete-case LSOAs"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
 
-## 5. LISA — Local Spatial Autocorrelation
-
-### 5.1 Build Spatial Weights
-
-```{r lisa-weights}
-sy_map_clean <- sy_map %>%
-  filter(!is.na(composite_score) & !is.na(inactive_rate))
-
-sy_sp      <- as(sy_map_clean, "Spatial")
-sy_nb      <- poly2nb(sy_sp, queen = TRUE)
-sy_weights <- nb2listw(sy_nb, style = "W", zero.policy = TRUE)
-
-cat("LISA weights built for", nrow(sy_map_clean), "LSOAs\n")
+ggsave(
+  "data/processed/county_durham_inactivity.png",
+  width = 9,
+  height = 7,
+  dpi = 300
+)
 ```
 
-### 5.2 Local Moran's I: Composite Score
+## 4. Main within-case analysis
 
-```{r lisa-composite}
-lisa_composite <- localmoran(
-  as.numeric(sy_map_clean$composite_score),
-  sy_weights,
-  zero.policy = TRUE,
-  na.action   = na.omit
+```{r main-dose-response}
+case_dose_response <- summarise_dose_response(
+  case_data,
+  n_low_access_dimensions
 )
 
-sy_map_clean <- sy_map_clean %>%
-  mutate(
-    lisa_i_composite  = lisa_composite[, "Ii"],
-    lisa_p_composite  = lisa_composite[, "Pr(z != E(Ii))"],
-    lisa_sig_composite = lisa_p_composite < 0.05
-  )
+print(case_dose_response)
 ```
 
-### 5.3 Local Moran's I: Inactivity Rate
+```{r main-dose-response-plot}
+ggplot(
+  case_data,
+  aes(
+    x = n_low_access_dimensions,
+    y = inactive_rate,
+    fill = n_low_access_dimensions
+  )
+) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.7) +
+  scale_fill_viridis_d(option = "plasma", direction = -1, guide = "none") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Economic Inactivity by Low-accessibility Dimensions",
+    subtitle = "County Durham, UN1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Economic inactivity rate"
+  ) +
+  theme_minimal(base_size = 13)
 
-```{r lisa-inactivity}
-lisa_inactivity <- localmoran(
-  as.numeric(sy_map_clean$inactive_rate),
-  sy_weights,
-  zero.policy = TRUE,
-  na.action   = na.omit
+ggsave(
+  "data/processed/county_durham_dose_response_boxplot.png",
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r main-models}
+case_trend_model <- lm(
+  inactive_rate ~ n_low_access_dimensions_num,
+  data = case_data
 )
 
-sy_map_clean <- sy_map_clean %>%
-  mutate(
-    lisa_i_inactivity  = lisa_inactivity[, "Ii"],
-    lisa_p_inactivity  = lisa_inactivity[, "Pr(z != E(Ii))"],
-    lisa_sig_inactivity = lisa_p_inactivity < 0.05
-  )
+case_adjusted_data <- case_data %>%
+  drop_na(deprivation_score)
+
+case_adjusted_model <- lm(
+  inactive_rate ~ n_low_access_dimensions_num + deprivation_score,
+  data = case_adjusted_data
+)
+
+cat("Unadjusted model n:", nobs(case_trend_model), "\n")
+print(summary(case_trend_model))
+
+cat("\nDeprivation-adjusted model n:", nobs(case_adjusted_model), "\n")
+print(summary(case_adjusted_model))
 ```
 
-### 5.4 Classify LISA Clusters (HH / HL / LH / LL)
+## 5. Spatial diagnostic of model residuals
 
-```{r lisa-clusters}
-mean_composite  <- mean(sy_map_clean$composite_score, na.rm = TRUE)
-mean_inactivity <- mean(sy_map_clean$inactive_rate,   na.rm = TRUE)
+```{r residual-morans-i}
+run_moran_mc <- function(sf_data, value_col, nsim = 999L, seed = 1L) {
+  usable <- sf_data %>%
+    filter(is.finite(.data[[value_col]])) %>%
+    st_make_valid()
 
-sy_map_clean <- sy_map_clean %>%
-  mutate(
-    # Composite LISA cluster
-    lisa_cluster_composite = case_when(
-      !lisa_sig_composite                                                        ~ "Not significant",
-      composite_score >= mean_composite & lisa_i_composite > 0                  ~ "HH",
-      composite_score <  mean_composite & lisa_i_composite > 0                  ~ "LL",
-      composite_score >= mean_composite & lisa_i_composite < 0                  ~ "HL",
-      composite_score <  mean_composite & lisa_i_composite < 0                  ~ "LH",
-      TRUE                                                                       ~ "Not significant"
+  nb <- poly2nb(usable, queen = TRUE)
+  lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+  set.seed(seed)
+  moran.mc(
+    usable[[value_col]],
+    lw,
+    nsim = nsim,
+    zero.policy = TRUE
+  )
+}
+
+trend_residuals <- tibble(
+  LSOA21CD = case_data$lsoa21_code,
+  trend_residual = residuals(case_trend_model)
+)
+
+adjusted_residuals <- tibble(
+  LSOA21CD = case_adjusted_data$lsoa21_code,
+  adjusted_residual = residuals(case_adjusted_model)
+)
+
+case_map_residuals <- case_map %>%
+  select(LSOA21CD, geometry) %>%
+  left_join(trend_residuals, by = "LSOA21CD") %>%
+  left_join(adjusted_residuals, by = "LSOA21CD")
+
+case_moran_results <- tryCatch(
+  list(
+    trend_residual = run_moran_mc(
+      case_map_residuals,
+      "trend_residual"
     ),
-    # Inactivity LISA cluster
-    lisa_cluster_inactivity = case_when(
-      !lisa_sig_inactivity                                                       ~ "Not significant",
-      inactive_rate >= mean_inactivity & lisa_i_inactivity > 0                  ~ "HH",
-      inactive_rate <  mean_inactivity & lisa_i_inactivity > 0                  ~ "LL",
-      inactive_rate >= mean_inactivity & lisa_i_inactivity < 0                  ~ "HL",
-      inactive_rate <  mean_inactivity & lisa_i_inactivity < 0                  ~ "LH",
-      TRUE                                                                       ~ "Not significant"
+    adjusted_residual = run_moran_mc(
+      case_map_residuals,
+      "adjusted_residual"
     )
-  )
-
-cat("LISA clusters (composite):\n")
-sy_map_clean %>% st_drop_geometry() %>% count(lisa_cluster_composite) %>% print()
-
-cat("\nLISA clusters (inactivity):\n")
-sy_map_clean %>% st_drop_geometry() %>% count(lisa_cluster_inactivity) %>% print()
-```
-
-### 5.5 Map LISA Clusters
-
-```{r map-lisa}
-cluster_colours <- c(
-  "HH"              = "#d62728",
-  "LL"              = "#1f77b4",
-  "HL"              = "#ff7f0e",
-  "LH"              = "#aec7e8",
-  "Not significant" = "grey85"
+  ),
+  error = function(e) {
+    warning("County Durham residual Moran's I was not completed: ", conditionMessage(e))
+    NULL
+  }
 )
 
-map_lisa_composite <- ggplot(sy_map_clean) +
-  geom_sf(aes(fill = lisa_cluster_composite), color = NA) +
-  scale_fill_manual(values = cluster_colours, name = "Cluster") +
+print(case_moran_results)
+```
+
+## 6. UN1 + UF1 sensitivity analysis
+
+```{r sensitivity-data}
+case_data_sens <- un1_uf1_analytic %>%
+  filter(la_name == selected_case_las)
+
+stopifnot(nrow(case_data_sens) > 0)
+
+case_dose_response_sens <- summarise_dose_response(
+  case_data_sens,
+  n_low_access_dimensions_sens
+)
+
+print(case_dose_response_sens)
+```
+
+```{r sensitivity-models}
+case_trend_model_sens <- lm(
+  inactive_rate ~ n_low_access_dimensions_sens_num,
+  data = case_data_sens
+)
+
+case_adjusted_data_sens <- case_data_sens %>%
+  drop_na(deprivation_score)
+
+case_adjusted_model_sens <- lm(
+  inactive_rate ~
+    n_low_access_dimensions_sens_num +
+    deprivation_score,
+  data = case_adjusted_data_sens
+)
+
+cat("Sensitivity unadjusted model n:", nobs(case_trend_model_sens), "\n")
+print(summary(case_trend_model_sens))
+
+cat("\nSensitivity adjusted model n:", nobs(case_adjusted_model_sens), "\n")
+print(summary(case_adjusted_model_sens))
+```
+
+```{r sensitivity-plot}
+ggplot(
+  case_data_sens,
+  aes(
+    x = n_low_access_dimensions_sens,
+    y = inactive_rate,
+    fill = n_low_access_dimensions_sens
+  )
+) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.7) +
+  scale_fill_viridis_d(option = "plasma", direction = -1, guide = "none") +
+  scale_y_continuous(labels = percent_format()) +
   labs(
-    title    = "LISA Clusters: Composite Disadvantage",
-    subtitle = "South Yorkshire — p < 0.05"
+    title = "Sensitivity Analysis: Economic Inactivity by Low-accessibility Dimensions",
+    subtitle = "County Durham, UN1 + UF1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Economic inactivity rate"
   ) +
-  theme_void(base_size = 12) +
-  theme(plot.background = element_rect(fill = "white"),
-        plot.title = element_text(hjust = 0.5, face = "bold"),
-        plot.subtitle = element_text(hjust = 0.5))
+  theme_minimal(base_size = 13)
 
-map_lisa_inactivity <- ggplot(sy_map_clean) +
-  geom_sf(aes(fill = lisa_cluster_inactivity), color = NA) +
-  scale_fill_manual(values = cluster_colours, name = "Cluster") +
-  labs(
-    title    = "LISA Clusters: Economic Inactivity",
-    subtitle = "South Yorkshire — p < 0.05"
-  ) +
-  theme_void(base_size = 12) +
-  theme(plot.background = element_rect(fill = "white"),
-        plot.title = element_text(hjust = 0.5, face = "bold"),
-        plot.subtitle = element_text(hjust = 0.5))
-
-map_lisa_composite + map_lisa_inactivity
-
-ggsave("data/processed/sy_lisa_maps.png", width = 14, height = 7, dpi = 300)
+ggsave(
+  "data/processed/county_durham_sensitivity_boxplot.png",
+  width = 9,
+  height = 6,
+  dpi = 300
+)
 ```
 
----
-
-## 6. Anomaly Detection — HL LSOAs
-
-### 6.1 Identify HL LSOAs
-
-```{r hl-anomalies}
-hl_lsoas <- sy_map_clean %>%
-  st_drop_geometry() %>%
-  filter(lisa_cluster_inactivity == "HL") %>%
-  select(LSOA21CD, LSOA21NM, inactive_rate, composite_score,
-         pt_car_gap, deprivation_score, cumulative_score)
-
-cat("HL LSOAs (inactivity):", nrow(hl_lsoas), "\n")
-print(hl_lsoas)
-```
-
-### 6.2 Compare HL vs Surrounding LSOAs
-
-```{r hl-comparison}
-sy_map_clean %>%
-  st_drop_geometry() %>%
-  filter(lisa_cluster_inactivity %in% c("HL", "LL", "LH")) %>%
-  group_by(lisa_cluster_inactivity) %>%
-  summarise(
-    n                 = n(),
-    mean_inactivity   = mean(inactive_rate,     na.rm = TRUE),
-    mean_composite    = mean(composite_score,   na.rm = TRUE),
-    mean_pt_car_gap   = mean(pt_car_gap,        na.rm = TRUE),
-    mean_deprivation  = mean(deprivation_score, na.rm = TRUE),
-    mean_accessibility = mean(cumulative_score,  na.rm = TRUE)
-  )
-```
-```{r}
-sy_map_clean %>%
-  st_drop_geometry() %>%
-  filter(lisa_cluster_inactivity == "HL") %>%
-  select(LSOA21NM, inactive_rate, pt_car_gap, composite_score, deprivation_score, cumulative_score) %>%
-  arrange(desc(inactive_rate)) %>%
-  as.data.frame()
-```
-
-```{r}
-car_ownership <- read_csv("data/raw/car_ownership_LSOA_2021.csv", skip = 7, show_col_types = FALSE) %>%
-  clean_names() %>%
-  select(
-    lsoa21_code = mnemonic,
-    total_households = total_all_households,
-    no_car = no_cars_or_vans_in_household
-  ) %>%
-  mutate(no_car_rate = no_car / total_households)
-
-head(car_ownership)
-```
-
-```{r}
-sy_map_clean <- sy_map_clean %>%
-  left_join(car_ownership %>% select(lsoa21_code, no_car_rate),
-            by = c("LSOA21CD" = "lsoa21_code"))
-
-# HL vs LL比較
-sy_map_clean %>%
-  st_drop_geometry() %>%
-  filter(lisa_cluster_inactivity %in% c("HL", "LL", "LH")) %>%
-  group_by(lisa_cluster_inactivity) %>%
-  summarise(
-    n               = n(),
-    mean_inactivity = mean(inactive_rate,  na.rm = TRUE),
-    mean_pt_car_gap = mean(pt_car_gap,     na.rm = TRUE),
-    mean_no_car     = mean(no_car_rate,    na.rm = TRUE),
-    mean_composite  = mean(composite_score, na.rm = TRUE)
-  )
-```
-
-```{r}
-sy_data %>%
-  summarise(
-    cor_emp   = cor(emp_score,         inactive_rate, use = "complete.obs"),
-    cor_gp    = cor(gp_score,          inactive_rate, use = "complete.obs"),
-    cor_super = cor(supermarket_score, inactive_rate, use = "complete.obs"),
-    cor_composite = cor(composite_score, inactive_rate, use = "complete.obs")
-  )
-```
-
-```{r}
-# 現在の閾値を確認
-cat("q75_emp:", q75_emp, "\n")
-cat("q75_gp:", q75_gp, "\n")
-cat("q75_super:", q75_super, "\n")
-
-# England全体の75パーセンタイルと比較
-cat("\nEngland全体:\n")
-cat("q75_emp_england:", quantile(cleaned_access_final$emp_score, 0.75, na.rm = TRUE), "\n")
-cat("q75_gp_england:", quantile(cleaned_access_final$gp_score, 0.75, na.rm = TRUE), "\n")
-cat("q75_super_england:", quantile(cleaned_access_final$supermarket_score, 0.75, na.rm = TRUE), "\n")
-
-cor(cleaned_access_final$emp_score,         cleaned_access_final$inactive_rate, use = "complete.obs")
-cor(cleaned_access_final$gp_score,          cleaned_access_final$inactive_rate, use = "complete.obs")
-cor(cleaned_access_final$supermarket_score, cleaned_access_final$inactive_rate, use = "complete.obs")
-cor(cleaned_access_final$cumulative_score,  cleaned_access_final$inactive_rate, use = "complete.obs")
-cor(cleaned_access_final$deprivation_score, cleaned_access_final$inactive_rate, use = "complete.obs")
-
-```
-
-```{r}
-sy_data <- sy_data %>%
-  left_join(car_ownership %>% select(lsoa21_code, no_car_rate),
-            by = c("lsoa21_code" = "lsoa21_code"))
-
-cor(sy_data$no_car_rate, sy_data$inactive_rate, use = "complete.obs")
-```
-
-```{r}
-sy_data %>%
-  select(emp_score, gp_score, supermarket_score, cumulative_score, 
-         deprivation_score, composite_score, inactive_rate) %>%
-  summary()
-```
-
-```{r}
-# South Yorkshire内のスコアの分布確認
-sy_data %>%
-  summarise(
-    mean_emp   = mean(emp_score, na.rm = TRUE),
-    mean_gp    = mean(gp_score, na.rm = TRUE),
-    mean_super = mean(supermarket_score, na.rm = TRUE),
-    sd_emp     = sd(emp_score, na.rm = TRUE),
-    sd_gp      = sd(gp_score, na.rm = TRUE),
-    sd_super   = sd(supermarket_score, na.rm = TRUE)
-  )
-```
-
-```{r}
-sy_data %>%
-  summarise(
-    cor_emp        = cor(emp_score,         inactive_rate, use = "complete.obs"),
-    cor_gp         = cor(gp_score,          inactive_rate, use = "complete.obs"),
-    cor_super      = cor(supermarket_score, inactive_rate, use = "complete.obs"),
-    cor_cumulative = cor(cumulative_score,  inactive_rate, use = "complete.obs"),
-    cor_deprivation = cor(deprivation_score, inactive_rate, use = "complete.obs"),
-    cor_composite  = cor(composite_score,   inactive_rate, use = "complete.obs")
-  )
-```
-
-
-
----
-
-## 7. Save Outputs
+## 7. Save outputs
 
 ```{r save}
-saveRDS(sy_data,     "data/processed/sy_data.rds")
-saveRDS(sy_map_clean,"data/processed/sy_map_clean.rds")
+saveRDS(case_data, "data/processed/case_data.rds")
+saveRDS(case_map, "data/processed/case_map.rds")
+saveRDS(case_boundary, "data/processed/case_boundary.rds")
+saveRDS(case_data_sens, "data/processed/case_data_sens.rds")
+saveRDS(case_dose_response, "data/processed/case_dose_response.rds")
+saveRDS(case_dose_response_sens, "data/processed/case_dose_response_sens.rds")
+saveRDS(case_trend_model, "data/processed/case_trend_model.rds")
+saveRDS(case_adjusted_model, "data/processed/case_adjusted_model.rds")
+saveRDS(case_trend_model_sens, "data/processed/case_trend_model_sens.rds")
+saveRDS(case_adjusted_model_sens, "data/processed/case_adjusted_model_sens.rds")
 
-cat("Saved sy_data.rds and sy_map_clean.rds\n")
+cat("County Durham Phase 2 outputs saved.\n")
 ```
