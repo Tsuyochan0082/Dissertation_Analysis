@@ -1,5 +1,5 @@
 ---
-title: "02 Phase 1: National Analysis"
+title: "02 Phase 1: National Screening"
 author: "Tsuyoshi Choh"
 date: "`r Sys.Date()`"
 output: html_document
@@ -7,16 +7,9 @@ output: html_document
 
 # Overview
 
-This file conducts the national-scale analysis for Phase 1:
+This file conducts the UN1 national analysis, selects County Durham using the accessibility-based criteria, and produces the UN1 + UF1 sensitivity ranking.
 
-1. LA-level ranking by composite disadvantage score
-2. Study area selection (South Yorkshire)
-3. Global Moran's I (spatial autocorrelation)
-4. England-wide maps
-
----
-
-## 1. Load Libraries and Data
+## 1. Setup
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(tidyverse)
@@ -25,231 +18,429 @@ library(spdep)
 library(ggplot2)
 library(scales)
 
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
 cleaned_access_final <- readRDS("data/processed/cleaned_access_final.rds")
-lsoa_map             <- readRDS("data/processed/lsoa_map.rds")
+lsoa_map <- readRDS("data/processed/lsoa_map.rds")
+un1_analytic <- readRDS("data/processed/un1_analytic.rds")
+un1_uf1_analytic <- readRDS("data/processed/un1_uf1_analytic.rds")
 
-cat("cleaned_access_final:", nrow(cleaned_access_final), "rows\n")
-cat("lsoa_map:", nrow(lsoa_map), "rows\n")
+MIN_TOTAL_LSOA <- 100L
+MIN_GROUP_LSOA <- 15L
+selected_case_las <- "County Durham"
+
+summarise_dose_response <- function(data, group_var) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarise(
+      n = n(),
+      mean_inactivity = mean(inactive_rate),
+      median_inactivity = median(inactive_rate),
+      sd_inactivity = sd(inactive_rate),
+      se = sd_inactivity / sqrt(n),
+      t_critical = qt(0.975, df = n - 1),
+      ci_lower = mean_inactivity - t_critical * se,
+      ci_upper = mean_inactivity + t_critical * se,
+      .groups = "drop"
+    )
+}
+
+cat("UN1 analytical sample:", nrow(un1_analytic), "LSOAs\n")
+cat("UN1 + UF1 sensitivity sample:", nrow(un1_uf1_analytic), "LSOAs\n")
 ```
 
----
+## 2. National distribution and dose-response
 
-## 2. LA-level Ranking
+```{r national-distribution}
+national_distribution <- un1_analytic %>%
+  count(n_low_access_dimensions, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
 
-### 2.1 All LAs
-
-```{r la-ranking-all}
-la_ranking_all <- cleaned_access_final %>%
-  group_by(la_name) %>%
-  summarise(
-    total_lsoa        = n(),
-    mean_composite    = mean(composite_score,   na.rm = TRUE),
-    mean_deprivation  = mean(deprivation_score, na.rm = TRUE),
-    mean_accessibility = mean(cumulative_score,  na.rm = TRUE),
-    mean_inactivity   = mean(inactive_rate,     na.rm = TRUE)
-  ) %>%
-  arrange(desc(mean_composite))
-
-head(la_ranking_all, 20)
+print(national_distribution)
 ```
 
-### 2.2 Urban LAs Only (UN1 + UF1, 100+ LSOAs)
-
-```{r la-ranking-urban}
-la_ranking_urban <- cleaned_access_final %>%
-  filter(RUC21CD %in% c("UN1", "UF1")) %>%
-  group_by(la_name) %>%
-  summarise(
-    total_lsoa        = n(),
-    mean_composite    = mean(composite_score,   na.rm = TRUE),
-    mean_deprivation  = mean(deprivation_score, na.rm = TRUE),
-    mean_accessibility = mean(cumulative_score,  na.rm = TRUE),
-    mean_inactivity   = mean(inactive_rate,     na.rm = TRUE)
-  ) %>%
-  filter(total_lsoa >= 100) %>%
-  arrange(desc(mean_composite))
-
-print(la_ranking_urban, n = 20)
-```
-
-### 2.3 South Yorkshire Position in Ranking
-
-```{r sy-position}
-sy_las <- c("Barnsley", "Doncaster", "Rotherham", "Sheffield")
-
-la_ranking_urban %>%
-  mutate(rank = row_number()) %>%
-  filter(la_name %in% sy_las) %>%
-  select(rank, la_name, total_lsoa, mean_composite, mean_inactivity)
-```
-
----
-
-## 3. Global Moran's I
-
-### 3.1 Build Spatial Weights Matrix
-
-```{r spatial-weights}
-lsoa_map_clean <- lsoa_map %>%
-  filter(!is.na(composite_score) & !is.na(inactive_rate))
-
-lsoa_sp  <- as(lsoa_map_clean, "Spatial")
-neighbors <- poly2nb(lsoa_sp, queen = TRUE)
-weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
-
-cat("Spatial weights built for", nrow(lsoa_map_clean), "LSOAs\n")
-```
-
-### 3.2 Moran's I: Composite Score
-
-```{r morans-i-composite}
-moran_composite <- moran.test(
-  as.numeric(lsoa_map_clean$composite_score),
-  weights,
-  zero.policy = TRUE,
-  na.action = na.omit
+```{r national-dose-response}
+national_dose_response <- summarise_dose_response(
+  un1_analytic,
+  n_low_access_dimensions
 )
 
-print(moran_composite)
-```
+print(national_dose_response)
 
-### 3.3 Moran's I: Economic Inactivity Rate
-
-```{r morans-i-inactivity}
-moran_inactivity <- moran.test(
-  as.numeric(lsoa_map_clean$inactive_rate),
-  weights,
-  zero.policy = TRUE,
-  na.action = na.omit
+national_trend_model <- lm(
+  inactive_rate ~ n_low_access_dimensions_num,
+  data = un1_analytic
 )
 
-print(moran_inactivity)
+summary(national_trend_model)
 ```
 
----
-
-## 4. England-wide Maps
-
-### 4.1 Composite Disadvantage Score
-
-```{r map-composite}
-ggplot(lsoa_map) +
-  geom_sf(aes(fill = composite_score), color = NA) +
-  scale_fill_viridis_c(
-    option = "plasma",
-    direction = -1,
-    name = "Composite\nDisadvantage",
-    na.value = "grey80"
-  ) +
-  labs(
-    title = "Composite Disadvantage Score by LSOA",
-    subtitle = "England 2021 (n = 31,810)"
-  ) +
-  theme_void(base_size = 13) +
-  theme(
-    plot.background = element_rect(fill = "white"),
-    plot.title    = element_text(hjust = 0.5, face = "bold"),
-    plot.subtitle = element_text(hjust = 0.5)
+```{r national-dose-response-plot}
+ggplot(
+  un1_analytic,
+  aes(
+    x = n_low_access_dimensions,
+    y = inactive_rate,
+    fill = n_low_access_dimensions
   )
+) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  scale_fill_viridis_d(option = "plasma", direction = -1, guide = "none") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Economic Inactivity by Number of Low-accessibility Dimensions",
+    subtitle = "England, UN1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Economic inactivity rate"
+  ) +
+  theme_minimal(base_size = 13)
 
-ggsave("data/processed/map_composite_england.png", width = 10, height = 12, dpi = 300)
+ggsave(
+  "data/processed/national_dose_response_boxplot.png",
+  width = 9,
+  height = 6,
+  dpi = 300
+)
 ```
 
-### 4.2 High Disadvantage LSOAs with South Yorkshire Highlighted
+## 3. Candidate ranking and case selection
 
-```{r map-high-disadvantage}
-# Threshold: top 10% urban LSOAs
-threshold_urban <- cleaned_access_final %>%
-  filter(RUC21CD %in% c("UN1", "UF1")) %>%
-  pull(composite_score) %>%
-  quantile(0.9, na.rm = TRUE)
-
-lsoa_map <- lsoa_map %>%
+```{r candidate-ranking}
+la_candidates <- un1_analytic %>%
+  group_by(la_name) %>%
+  summarise(
+    n = n(),
+    pct_2plus = mean(n_low_access_dimensions_num >= 2) * 100,
+    pct_3 = mean(n_low_access_dimensions_num == 3) * 100,
+    mean_A = mean(mean_access_disadvantage),
+    n_dim0 = sum(n_low_access_dimensions_num == 0),
+    n_dim1 = sum(n_low_access_dimensions_num == 1),
+    n_dim2 = sum(n_low_access_dimensions_num == 2),
+    n_dim3 = sum(n_low_access_dimensions_num == 3),
+    .groups = "drop"
+  ) %>%
+  filter(n >= MIN_TOTAL_LSOA) %>%
+  arrange(desc(pct_2plus), desc(n)) %>%
   mutate(
-    high_disadvantage  = composite_score >= threshold_urban & RUC21CD %in% c("UN1", "UF1"),
-    is_south_yorkshire = str_detect(LSOA21NM, "Barnsley|Doncaster|Rotherham|Sheffield")
+    rank_2plus = row_number(),
+    min_group_n = pmin(n_dim0, n_dim1, n_dim2, n_dim3),
+    internal_variation_ok = min_group_n >= MIN_GROUP_LSOA
   )
 
-# South Yorkshire boundary
-south_yorks_boundary <- lsoa_map %>%
-  filter(is_south_yorkshire) %>%
-  st_union()
+suitable_candidates <- la_candidates %>%
+  filter(internal_variation_ok) %>%
+  arrange(desc(pct_2plus), desc(n)) %>%
+  mutate(rank_suitable = row_number())
 
-ggplot(lsoa_map) +
-  geom_sf(fill = "grey90", color = NA) +
+cat("Top 15 eligible local authorities by pct_2plus:\n")
+la_candidates %>%
+  select(
+    rank_2plus, la_name, n, pct_2plus,
+    n_dim0, n_dim1, n_dim2, n_dim3,
+    min_group_n, internal_variation_ok
+  ) %>%
+  slice_head(n = 15) %>%
+  print()
+
+cat("\nTop candidates retaining at least", MIN_GROUP_LSOA,
+    "LSOAs in every 0-3 group:\n")
+suitable_candidates %>%
+  select(
+    rank_suitable, rank_2plus, la_name, n, pct_2plus,
+    n_dim0, n_dim1, n_dim2, n_dim3, min_group_n
+  ) %>%
+  slice_head(n = 10) %>%
+  print()
+```
+
+```{r case-selection}
+selected_case_summary <- suitable_candidates %>%
+  filter(la_name == selected_case_las)
+
+if (nrow(selected_case_summary) != 1) {
+  stop("County Durham is missing from the analytically suitable candidate table.")
+}
+
+print(selected_case_summary)
+
+selected_case_distribution <- un1_analytic %>%
+  filter(la_name == selected_case_las) %>%
+  count(n_low_access_dimensions, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
+
+print(selected_case_distribution)
+
+stopifnot(
+  sum(selected_case_distribution$n) == selected_case_summary$n,
+  selected_case_summary$internal_variation_ok
+)
+```
+
+## 4. England-wide maps
+
+```{r map-preparation}
+main_sample_codes <- un1_analytic$lsoa21_code
+
+england_overlap_map <- lsoa_map %>%
+  mutate(
+    in_main_sample = LSOA21CD %in% main_sample_codes,
+    overlap_class = case_when(
+      in_main_sample & n_low_access_dimensions_num >= 2 ~
+        "2 or 3 low-accessibility dimensions",
+      in_main_sample ~ "0 or 1 low-accessibility dimension",
+      TRUE ~ "Outside UN1 complete-case sample"
+    ),
+    overlap_class = factor(
+      overlap_class,
+      levels = c(
+        "Outside UN1 complete-case sample",
+        "0 or 1 low-accessibility dimension",
+        "2 or 3 low-accessibility dimensions"
+      )
+    )
+  )
+
+selected_case_boundary <- lsoa_map %>%
+  filter(la_name == selected_case_las) %>%
+  summarise(geometry = st_union(geometry))
+
+if (nrow(selected_case_boundary) != 1 || st_is_empty(selected_case_boundary)) {
+  stop("County Durham boundary could not be constructed.")
+}
+
+selected_case_map_check <- england_overlap_map %>%
+  st_drop_geometry() %>%
+  filter(la_name == selected_case_las) %>%
+  summarise(
+    main_sample_lsoas = sum(in_main_sample),
+    red_lsoas = sum(
+      in_main_sample & n_low_access_dimensions_num >= 2,
+      na.rm = TRUE
+    )
+  )
+
+print(selected_case_map_check)
+
+stopifnot(
+  selected_case_map_check$main_sample_lsoas == selected_case_summary$n,
+  selected_case_map_check$red_lsoas ==
+    selected_case_summary$n_dim2 + selected_case_summary$n_dim3
+)
+```
+
+```{r map-low-access-overlap}
+ggplot(england_overlap_map) +
+  geom_sf(aes(fill = overlap_class), color = NA) +
   geom_sf(
-    data = lsoa_map %>% filter(high_disadvantage == TRUE),
-    fill = "#d62728", color = NA, alpha = 0.8
+    data = selected_case_boundary,
+    fill = NA,
+    color = "black",
+    linewidth = 0.7
   ) +
-  geom_sf(data = south_yorks_boundary, fill = NA, color = "black", linewidth = 0.4) +
+  scale_fill_manual(
+    values = c(
+      "Outside UN1 complete-case sample" = "grey95",
+      "0 or 1 low-accessibility dimension" = "grey65",
+      "2 or 3 low-accessibility dimensions" = "#d62728"
+    ),
+    name = NULL,
+    drop = FALSE
+  ) +
   labs(
-    title    = "High Disadvantage LSOAs — England",
-    subtitle = "Top 10% urban LSOAs by composite score. South Yorkshire outlined."
+    title = "Multiple Low-accessibility Dimensions in England",
+    subtitle = "County Durham is outlined; classification applies only to UN1 complete-case LSOAs"
   ) +
-  theme_void(base_size = 13) +
+  theme_void(base_size = 12) +
   theme(
-    plot.background = element_rect(fill = "white"),
-    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
     plot.subtitle = element_text(hjust = 0.5)
   )
 
-ggsave("data/processed/map_high_disadvantage_england.png", width = 10, height = 12, dpi = 300)
+ggsave(
+  "data/processed/map_low_access_overlap_england.png",
+  width = 10,
+  height = 12,
+  dpi = 300
+)
 ```
-
-### 4.3 Economic Inactivity Rate
 
 ```{r map-inactivity}
-ggplot(lsoa_map) +
-  geom_sf(aes(fill = inactive_rate), color = NA) +
+england_inactivity_map <- lsoa_map %>%
+  mutate(
+    inactive_rate_main = if_else(
+      LSOA21CD %in% main_sample_codes,
+      inactive_rate,
+      NA_real_
+    )
+  )
+
+ggplot(england_inactivity_map) +
+  geom_sf(aes(fill = inactive_rate_main), color = NA) +
+  geom_sf(
+    data = selected_case_boundary,
+    fill = NA,
+    color = "black",
+    linewidth = 0.7
+  ) +
   scale_fill_viridis_c(
     option = "magma",
     direction = -1,
-    name = "Inactivity\nRate",
-    na.value = "grey80",
+    name = "Economic inactivity",
+    na.value = "grey95",
     labels = percent_format()
   ) +
   labs(
-    title    = "Economic Inactivity Rate by LSOA",
-    subtitle = "England 2021 (n = 31,810)"
+    title = "Economic Inactivity Rate in the Main Analytical Sample",
+    subtitle = "England, UN1 complete-case LSOAs; County Durham outlined"
   ) +
-  theme_void(base_size = 13) +
+  theme_void(base_size = 12) +
   theme(
-    plot.background = element_rect(fill = "white"),
-    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
     plot.subtitle = element_text(hjust = 0.5)
   )
 
-ggsave("data/processed/map_inactivity_england.png", width = 10, height = 12, dpi = 300)
+ggsave(
+  "data/processed/map_inactivity_england.png",
+  width = 10,
+  height = 12,
+  dpi = 300
+)
 ```
 
----
+## 5. UN1 + UF1 sensitivity ranking
 
-## 5. Correlation Check
+```{r sensitivity-ranking}
+la_candidates_sens <- un1_uf1_analytic %>%
+  group_by(la_name) %>%
+  summarise(
+    total_lsoa = n(),
+    pct_2plus = mean(n_low_access_dimensions_sens_num >= 2) * 100,
+    n_dim0 = sum(n_low_access_dimensions_sens_num == 0),
+    n_dim1 = sum(n_low_access_dimensions_sens_num == 1),
+    n_dim2 = sum(n_low_access_dimensions_sens_num == 2),
+    n_dim3 = sum(n_low_access_dimensions_sens_num == 3),
+    .groups = "drop"
+  ) %>%
+  filter(total_lsoa >= MIN_TOTAL_LSOA) %>%
+  arrange(desc(pct_2plus), desc(total_lsoa)) %>%
+  mutate(rank = row_number())
 
-```{r correlation}
-cor_overall <- cor(
-  cleaned_access_final$composite_score,
-  cleaned_access_final$inactive_rate,
+cat("Top 10 sensitivity-ranking local authorities:\n")
+la_candidates_sens %>%
+  slice_head(n = 10) %>%
+  print()
+
+cat("\nCounty Durham in the sensitivity ranking:\n")
+la_candidates_sens %>%
+  filter(la_name == selected_case_las) %>%
+  print()
+```
+
+## 6. Appendix analyses
+
+```{r appendix-combined-score}
+la_ranking_composite <- un1_analytic %>%
+  group_by(la_name) %>%
+  summarise(
+    total_lsoa = n(),
+    mean_composite = mean(combined_area_disadvantage, na.rm = TRUE),
+    mean_deprivation = mean(deprivation_score, na.rm = TRUE),
+    mean_accessibility = mean(mean_access_disadvantage, na.rm = TRUE),
+    mean_inactivity = mean(inactive_rate),
+    .groups = "drop"
+  ) %>%
+  filter(total_lsoa >= MIN_TOTAL_LSOA) %>%
+  arrange(desc(mean_composite)) %>%
+  mutate(rank_composite = row_number())
+
+la_ranking_composite %>%
+  slice_head(n = 10) %>%
+  print()
+
+cat("\nCounty Durham in the combined-score ranking:\n")
+la_ranking_composite %>%
+  filter(la_name == selected_case_las) %>%
+  print()
+
+cat("\nUN1 correlation between C and economic inactivity:\n")
+print(cor(
+  un1_analytic$combined_area_disadvantage,
+  un1_analytic$inactive_rate,
   use = "complete.obs"
+))
+```
+
+```{r appendix-morans-i}
+run_moran_mc <- function(sf_data, value_col, nsim = 999L, seed = 1L) {
+  usable <- sf_data %>%
+    filter(is.finite(.data[[value_col]])) %>%
+    st_make_valid()
+
+  nb <- poly2nb(usable, queen = TRUE)
+  lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+  set.seed(seed)
+  moran.mc(
+    usable[[value_col]],
+    lw,
+    nsim = nsim,
+    zero.policy = TRUE
+  )
+}
+
+un1_map_for_spatial <- lsoa_map %>%
+  select(LSOA21CD, geometry) %>%
+  inner_join(
+    un1_analytic %>%
+      transmute(
+        LSOA21CD = lsoa21_code,
+        inactive_rate,
+        n_low_access_dimensions_num
+      ),
+    by = "LSOA21CD"
+  )
+
+national_residuals <- tibble(
+  LSOA21CD = un1_analytic$lsoa21_code,
+  national_trend_residual = residuals(national_trend_model)
 )
 
-cat("Correlation (composite vs inactivity, England):", round(cor_overall, 3), "\n")
+un1_map_for_spatial <- un1_map_for_spatial %>%
+  left_join(national_residuals, by = "LSOA21CD")
 
-# By urban/rural
-cleaned_access_final %>%
-  mutate(urban_rural = ifelse(RUC21CD %in% c("UN1", "UF1"), "Urban", "Rural")) %>%
-  group_by(urban_rural) %>%
-  summarise(
-    n           = n(),
-    correlation = cor(composite_score, inactive_rate, use = "complete.obs")
-  )
+moran_results <- tryCatch(
+  list(
+    inactivity = run_moran_mc(un1_map_for_spatial, "inactive_rate"),
+    dimensions = run_moran_mc(
+      un1_map_for_spatial,
+      "n_low_access_dimensions_num"
+    ),
+    trend_residual = run_moran_mc(
+      un1_map_for_spatial,
+      "national_trend_residual"
+    )
+  ),
+  error = function(e) {
+    warning("Moran's I diagnostic was not completed: ", conditionMessage(e))
+    NULL
+  }
+)
+
+print(moran_results)
 ```
 
----
-
-## 6. Save Updated lsoa_map
+## 7. Save outputs
 
 ```{r save}
 saveRDS(lsoa_map, "data/processed/lsoa_map.rds")
-cat("lsoa_map updated and saved\n")
+saveRDS(selected_case_las, "data/processed/selected_case_las.rds")
+saveRDS(la_candidates, "data/processed/la_candidates_un1.rds")
+saveRDS(suitable_candidates, "data/processed/suitable_candidates_un1.rds")
+saveRDS(la_candidates_sens, "data/processed/la_candidates_un1_uf1.rds")
+saveRDS(national_dose_response, "data/processed/national_dose_response.rds")
+saveRDS(national_trend_model, "data/processed/national_trend_model.rds")
+
+cat("Phase 1 outputs saved. Selected case: County Durham.\n")
 ```
