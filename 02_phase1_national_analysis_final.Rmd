@@ -1,0 +1,385 @@
+---
+title: "02 Phase 1: National Screening"
+author: "Tsuyoshi Choh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+This file conducts the UN1 national analysis, selects County Durham using the accessibility-based criteria, and produces the UN1 + UF1 sensitivity ranking.
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(ggplot2)
+library(scales)
+
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+cleaned_access_final <- readRDS("data/processed/cleaned_access_final.rds")
+lsoa_map <- readRDS("data/processed/lsoa_map.rds")
+un1_analytic <- readRDS("data/processed/un1_analytic.rds")
+un1_uf1_analytic <- readRDS("data/processed/un1_uf1_analytic.rds")
+
+MIN_TOTAL_LSOA <- 100L
+MIN_GROUP_LSOA <- 15L
+selected_case_las <- "County Durham"
+
+summarise_dose_response <- function(data, group_var) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarise(
+      n = n(),
+      mean_inactivity = mean(inactive_rate),
+      median_inactivity = median(inactive_rate),
+      sd_inactivity = sd(inactive_rate),
+      se = sd_inactivity / sqrt(n),
+      t_critical = qt(0.975, df = n - 1),
+      ci_lower = mean_inactivity - t_critical * se,
+      ci_upper = mean_inactivity + t_critical * se,
+      .groups = "drop"
+    )
+}
+
+cat("UN1 analytical sample:", nrow(un1_analytic), "LSOAs\n")
+cat("UN1 + UF1 sensitivity sample:", nrow(un1_uf1_analytic), "LSOAs\n")
+```
+
+## 2. National distribution and dose-response
+
+```{r national-distribution}
+national_distribution <- un1_analytic %>%
+  count(n_low_access_dimensions, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
+
+print(national_distribution)
+```
+
+```{r national-dose-response}
+national_dose_response <- summarise_dose_response(
+  un1_analytic,
+  n_low_access_dimensions
+)
+
+print(national_dose_response)
+
+national_trend_model <- lm(
+  inactive_rate ~ n_low_access_dimensions_num,
+  data = un1_analytic
+)
+
+summary(national_trend_model)
+```
+
+## 2. Candidate ranking and case selection
+
+```{r candidate-ranking}
+la_candidates <- un1_analytic %>%
+  group_by(la_name) %>%
+  summarise(
+    n = n(),
+    pct_2plus = mean(n_low_access_dimensions_num >= 2) * 100,
+    pct_3 = mean(n_low_access_dimensions_num == 3) * 100,
+    mean_A = mean(mean_access_disadvantage),
+    n_dim0 = sum(n_low_access_dimensions_num == 0),
+    n_dim1 = sum(n_low_access_dimensions_num == 1),
+    n_dim2 = sum(n_low_access_dimensions_num == 2),
+    n_dim3 = sum(n_low_access_dimensions_num == 3),
+    .groups = "drop"
+  ) %>%
+  filter(n >= MIN_TOTAL_LSOA) %>%
+  arrange(desc(pct_2plus), desc(n)) %>%
+  mutate(
+    rank_2plus = row_number(),
+    min_group_n = pmin(n_dim0, n_dim1, n_dim2, n_dim3),
+    internal_variation_ok = min_group_n >= MIN_GROUP_LSOA
+  )
+
+suitable_candidates <- la_candidates %>%
+  filter(internal_variation_ok) %>%
+  arrange(desc(pct_2plus), desc(n)) %>%
+  mutate(rank_suitable = row_number())
+
+cat("Top 15 eligible local authorities by pct_2plus:\n")
+la_candidates %>%
+  select(
+    rank_2plus, la_name, n, pct_2plus,
+    n_dim0, n_dim1, n_dim2, n_dim3,
+    min_group_n, internal_variation_ok
+  ) %>%
+  slice_head(n = 15) %>%
+  print()
+
+cat("\nTop candidates retaining at least", MIN_GROUP_LSOA,
+    "LSOAs in every 0-3 group:\n")
+suitable_candidates %>%
+  select(
+    rank_suitable, rank_2plus, la_name, n, pct_2plus,
+    n_dim0, n_dim1, n_dim2, n_dim3, min_group_n
+  ) %>%
+  slice_head(n = 10) %>%
+  print()
+```
+
+```{r case-selection}
+selected_case_summary <- suitable_candidates %>%
+  filter(la_name == selected_case_las)
+
+if (nrow(selected_case_summary) != 1) {
+  stop("County Durham is missing from the analytically suitable candidate table.")
+}
+
+print(selected_case_summary)
+
+selected_case_distribution <- un1_analytic %>%
+  filter(la_name == selected_case_las) %>%
+  count(n_low_access_dimensions, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
+
+print(selected_case_distribution)
+
+stopifnot(
+  sum(selected_case_distribution$n) == selected_case_summary$n,
+  selected_case_summary$internal_variation_ok
+)
+```
+
+## 3. England-wide maps
+
+```{r map-preparation}
+main_sample_codes <- un1_analytic$lsoa21_code
+
+england_overlap_map <- lsoa_map %>%
+  mutate(
+    in_main_sample = LSOA21CD %in% main_sample_codes,
+    overlap_class = case_when(
+      in_main_sample & n_low_access_dimensions_num >= 2 ~
+        "2 or 3 low-accessibility dimensions",
+      in_main_sample ~ "0 or 1 low-accessibility dimension",
+      TRUE ~ "Outside UN1 complete-case sample"
+    ),
+    overlap_class = factor(
+      overlap_class,
+      levels = c(
+        "Outside UN1 complete-case sample",
+        "0 or 1 low-accessibility dimension",
+        "2 or 3 low-accessibility dimensions"
+      )
+    )
+  )
+
+selected_case_boundary <- lsoa_map %>%
+  filter(la_name == selected_case_las) %>%
+  summarise(geometry = st_union(geometry))
+
+if (nrow(selected_case_boundary) != 1 || st_is_empty(selected_case_boundary)) {
+  stop("County Durham boundary could not be constructed.")
+}
+
+selected_case_map_check <- england_overlap_map %>%
+  st_drop_geometry() %>%
+  filter(la_name == selected_case_las) %>%
+  summarise(
+    main_sample_lsoas = sum(in_main_sample),
+    red_lsoas = sum(
+      in_main_sample & n_low_access_dimensions_num >= 2,
+      na.rm = TRUE
+    )
+  )
+
+print(selected_case_map_check)
+
+stopifnot(
+  selected_case_map_check$main_sample_lsoas == selected_case_summary$n,
+  selected_case_map_check$red_lsoas ==
+    selected_case_summary$n_dim2 + selected_case_summary$n_dim3
+)
+```
+
+```{r map-low-access-overlap}
+ggplot(england_overlap_map) +
+  geom_sf(aes(fill = overlap_class), color = NA) +
+  scale_fill_manual(
+    values = c(
+      "Outside UN1 complete-case sample" = "grey95",
+      "0 or 1 low-accessibility dimension" = "grey65",
+      "2 or 3 low-accessibility dimensions" = "#d62728"
+    ),
+    name = NULL,
+    drop = FALSE
+  ) +
+  labs(
+    title = "Multiple Low-accessibility Dimensions in England",
+    subtitle = "County Durham is outlined; classification applies only to UN1 complete-case LSOAs"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+ggsave(
+  "data/processed/map_low_access_overlap_england.png",
+  width = 10,
+  height = 12,
+  dpi = 300
+)
+```
+
+
+
+## 4. UN1 + UF1 sensitivity ranking
+
+```{r sensitivity-ranking}
+la_candidates_sens <- un1_uf1_analytic %>%
+  group_by(la_name) %>%
+  summarise(
+    total_lsoa = n(),
+    pct_2plus = mean(n_low_access_dimensions_sens_num >= 2) * 100,
+    n_dim0 = sum(n_low_access_dimensions_sens_num == 0),
+    n_dim1 = sum(n_low_access_dimensions_sens_num == 1),
+    n_dim2 = sum(n_low_access_dimensions_sens_num == 2),
+    n_dim3 = sum(n_low_access_dimensions_sens_num == 3),
+    .groups = "drop"
+  ) %>%
+  filter(total_lsoa >= MIN_TOTAL_LSOA) %>%
+  arrange(desc(pct_2plus), desc(total_lsoa)) %>%
+  mutate(rank = row_number())
+
+cat("Top 10 sensitivity-ranking local authorities:\n")
+la_candidates_sens %>%
+  slice_head(n = 10) %>%
+  print()
+
+cat("\nCounty Durham in the sensitivity ranking:\n")
+la_candidates_sens %>%
+  filter(la_name == selected_case_las) %>%
+  print()
+```
+
+## 5. Appendix analyses
+
+```{r}
+## UN1 + UF1 national sensitivity
+
+national_distribution_sens <- un1_uf1_analytic %>%
+  count(n_low_access_dimensions_sens, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
+
+print(national_distribution_sens)
+
+national_dose_response_sens <- summarise_dose_response(
+  un1_uf1_analytic,
+  n_low_access_dimensions_sens
+)
+
+print(national_dose_response_sens)
+
+national_trend_model_sens <- lm(
+  inactive_rate ~ n_low_access_dimensions_sens_num,
+  data = un1_uf1_analytic
+)
+
+summary(national_trend_model_sens)
+```
+
+```{r}
+## B.2 Candidate ranking sensitivity: UN1 + UF1
+
+la_candidates_sens <- un1_uf1_analytic %>%
+  group_by(la_name) %>%
+  summarise(
+    n = n(),
+    pct_2plus = mean(n_low_access_dimensions_sens_num >= 2, na.rm = TRUE) * 100,
+    n_dim0 = sum(n_low_access_dimensions_sens_num == 0, na.rm = TRUE),
+    n_dim1 = sum(n_low_access_dimensions_sens_num == 1, na.rm = TRUE),
+    n_dim2 = sum(n_low_access_dimensions_sens_num == 2, na.rm = TRUE),
+    n_dim3 = sum(n_low_access_dimensions_sens_num == 3, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 100) %>%
+  arrange(desc(pct_2plus), desc(n)) %>%
+  mutate(
+    rank_2plus = row_number(),
+    min_group_n = pmin(n_dim0, n_dim1, n_dim2, n_dim3),
+    internal_variation_ok = min_group_n >= 15
+  )
+
+# Top 15 candidate areas
+la_candidates_sens %>%
+  select(
+    rank_2plus,
+    la_name,
+    n,
+    pct_2plus,
+    n_dim0,
+    n_dim1,
+    n_dim2,
+    n_dim3,
+    min_group_n,
+    internal_variation_ok
+  ) %>%
+  slice_head(n = 15) %>%
+  print(n = 15)
+
+# County Durham specifically
+county_durham_sens <- la_candidates_sens %>%
+  filter(la_name == "County Durham") %>%
+  select(
+    rank_2plus,
+    la_name,
+    n,
+    pct_2plus,
+    n_dim0,
+    n_dim1,
+    n_dim2,
+    n_dim3,
+    min_group_n,
+    internal_variation_ok
+  )
+
+print(county_durham_sens)
+
+un1_uf1_analytic %>%
+  filter(la_name == "County Durham") %>%
+  count(RUC21CD)
+
+names(un1_uf1_analytic)
+
+nrow(un1_analytic %>% filter(la_name == "County Durham"))
+
+nrow(un1_uf1_analytic %>% filter(la_name == "County Durham"))
+
+setdiff(
+  un1_uf1_analytic %>%
+    filter(la_name == "County Durham") %>%
+    pull(lsoa21_code),
+
+  un1_analytic %>%
+    filter(la_name == "County Durham") %>%
+    pull(lsoa21_code)
+)
+
+un1_uf1_analytic %>%
+  filter(lsoa21_code == "E01020637") %>%
+  select(lsoa21_code, lsoa_name, la_name, RUC21CD, RUC21NM)
+```
+
+## 7. Save outputs
+
+```{r save}
+saveRDS(lsoa_map, "data/processed/lsoa_map.rds")
+saveRDS(selected_case_las, "data/processed/selected_case_las.rds")
+saveRDS(la_candidates, "data/processed/la_candidates_un1.rds")
+saveRDS(suitable_candidates, "data/processed/suitable_candidates_un1.rds")
+saveRDS(la_candidates_sens, "data/processed/la_candidates_un1_uf1.rds")
+saveRDS(national_dose_response, "data/processed/national_dose_response.rds")
+saveRDS(national_trend_model, "data/processed/national_trend_model.rds")
+
+cat("Phase 1 outputs saved. Selected case: County Durham.\n")
+```

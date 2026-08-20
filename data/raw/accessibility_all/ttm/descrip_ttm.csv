@@ -1,0 +1,6 @@
+﻿Variable,Type,Description 
+fromId,nominal,2011 LSOA/DZ geo-code of origin
+toId,nominal,2011 LSOA/DZ geo-code of destination
+travel_time_p025,numeric,25 travel time percentile by public transport in minutes
+travel_time_p050,numeric,50 travel time percentile by public transport in minutes
+travel_time_p075,numeric,75 travel time percentile by public transport in minutes

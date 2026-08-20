@@ -1,0 +1,20 @@
+﻿type_destination,file,measure,description
+Employment,employment/access_employment_pt.csv ,"Cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of employment positions within N minutes by public transport
+Employment,employment/access_employment_pt.csv ,"Relative cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of employment positions within N minutes by public transport divided by the total number in Great Britain
+GPs,gp/access_gp_pt.csv                ,"Cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of GPs within N minutes by public transport
+GPs,gp/access_gp_pt.csv                ,"Relative cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of GPs within N minutes by public transport divided by the total number in Great Britain
+GPs,gp/access_gp_pt.csv                ,Minimum travel time,Closest LSOA/DZ that contains at least one GP
+Hospitals,hospitals/access_hospital_pt.csv    ,"Cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of hospitals within N minutes by public transport
+Hospitals,hospitals/access_hospital_pt.csv    ,"Relative cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of hospitals within N minutes by public transport divided by the total number in Great Britain
+Hospitals,hospitals/access_hospital_pt.csv    ,Minimum travel time,Closest LSOA/DZ that contains at least one hospital
+Education: Primary schools,schools/access_school_pt.csv       ,"Cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of primary schools within N minutes by public transport
+Education: Primary schools,schools/access_school_pt.csv       ,"Relative cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of primary schools within N minutes by public transport divided by the total number in Great Britain
+Education: Primary schools,schools/access_school_pt.csv       ,Minimum travel time,Closest LSOA/DZ that contains at least one primary school
+Education: Secondary schools,schools/access_school_pt.csv       ,"Cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of secondary schools within N minutes by public transport
+Education: Secondary schools,schools/access_school_pt.csv       ,"Relative cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of secondary schools within N minutes by public transport divided by the total number in Great Britain
+Education: Secondary schools,schools/access_school_pt.csv       ,Minimum travel time,Closest LSOA/DZ that contains at least one secondary school
+Urban centre: City,urban_centre/access_cities_pt.csv ,Minimum travel time,Closest city
+Urban centre: Greater city,urban_centre/access_cities_pt.csv ,Minimum travel time,Closest greater city
+Supermarkets,supermarket/access_supermaet_pt.csv ,"Cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of supermarkets within N minutes by public transport
+Supermarkets,supermarket/access_supermaet_pt.csv ,"Relative cumulative: time cut 15, 30, 45, 60, 75, 90, 105, 120",Number of supermarkets within N minutes by public transport divided by the total number in Great Britain
+Supermarkets,supermarket/access_supermaet_pt.csv ,Minimum travel time,Closest LSOA/DZ that contains at least one supermarket

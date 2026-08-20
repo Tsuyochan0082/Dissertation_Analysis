@@ -1,0 +1,544 @@
+---
+title: "03 Phase 2: County Durham Case Study"
+author: "Tsuyoshi Choh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+This file performs the County Durham within-area analysis using the same 0-3 low-accessibility measure as Phase 1.
+
+## 1. Setup and extraction
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(ggplot2)
+library(scales)
+
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+lsoa_map <- readRDS("data/processed/lsoa_map.rds")
+un1_analytic <- readRDS("data/processed/un1_analytic.rds")
+un1_uf1_analytic <- readRDS("data/processed/un1_uf1_analytic.rds")
+selected_case_las <- readRDS("data/processed/selected_case_las.rds")
+
+if (length(selected_case_las) != 1 || selected_case_las != "County Durham") {
+  stop("The selected case must be County Durham. Re-run the final Phase 1 file.")
+}
+
+summarise_dose_response <- function(data, group_var) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarise(
+      n = n(),
+      mean_inactivity = mean(inactive_rate),
+      median_inactivity = median(inactive_rate),
+      sd_inactivity = sd(inactive_rate),
+      se = sd_inactivity / sqrt(n),
+      t_critical = qt(0.975, df = n - 1),
+      ci_lower = mean_inactivity - t_critical * se,
+      ci_upper = mean_inactivity + t_critical * se,
+      .groups = "drop"
+    )
+}
+
+case_data <- un1_analytic %>%
+  filter(la_name == selected_case_las)
+
+case_attributes <- case_data %>%
+  rename(LSOA21CD = lsoa21_code)
+
+case_map <- lsoa_map %>%
+  select(LSOA21CD, geometry) %>%
+  inner_join(case_attributes, by = "LSOA21CD") %>%
+  st_make_valid()
+
+county_durham_codes <- imd_2021 %>%
+  filter(la_name_lookup == selected_case_las) %>%
+  pull(lsoa21cd)
+
+case_boundary <- lsoa_sf %>%
+  filter(LSOA21CD %in% county_durham_codes) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  st_make_valid()
+
+stopifnot(
+  nrow(case_data) > 0,
+  nrow(case_map) == nrow(case_data),
+  n_distinct(case_map$LSOA21CD) == nrow(case_map),
+  !st_is_empty(case_boundary)
+)
+
+cat("Selected case:", selected_case_las, "\n")
+cat("UN1 complete-case LSOAs:", nrow(case_data), "\n")
+```
+
+## 2. Internal distribution
+
+```{r internal-distribution}
+case_internal_distribution <- case_data %>%
+  count(n_low_access_dimensions, name = "n") %>%
+  mutate(percentage = n / sum(n) * 100)
+
+print(case_internal_distribution)
+
+case_dimension_combinations <- case_data %>%
+  count(
+    low_employment_accessibility,
+    low_gp_accessibility,
+    low_supermarket_accessibility,
+    name = "n"
+  ) %>%
+  arrange(desc(n))
+
+print(case_dimension_combinations)
+```
+
+## 3. County Durham maps
+
+```{r map-dimensions}
+ggplot() +
+  geom_sf(
+    data = case_boundary,
+    fill = "grey95",
+    color = "grey40",
+    linewidth = 0.4
+  ) +
+  geom_sf(
+    data = case_map,
+    aes(fill = n_low_access_dimensions),
+    color = "white",
+    linewidth = 0.05
+  ) +
+  scale_fill_viridis_d(
+    option = "plasma",
+    direction = -1,
+    name = "Low-accessibility\ndimensions",
+    drop = FALSE
+  ) +
+  labs(
+    title = "Number of Low-accessibility Dimensions in County Durham",
+    subtitle = "Coloured areas are UN1 complete-case LSOAs; grey areas are outside the main sample"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+ggsave(
+  "data/processed/county_durham_low_access_dimensions.png",
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+```
+
+
+```{r map-inactivity}
+ggplot() +
+  geom_sf(
+    data = case_boundary,
+    fill = "grey95",
+    color = "grey40",
+    linewidth = 0.4
+  ) +
+  geom_sf(
+    data = case_map,
+    aes(fill = inactive_rate),
+    color = "white",
+    linewidth = 0.05
+  ) +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    name = "Economic inactivity",
+    labels = percent_format()
+  ) +
+  labs(
+    title = "Economic Inactivity Rate in County Durham",
+    subtitle = "UN1 complete-case LSOAs"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+ggsave(
+  "data/processed/county_durham_inactivity.png",
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+```
+
+## 4. Main within-case analysis
+
+```{r main-dose-response}
+case_dose_response <- summarise_dose_response(
+  case_data,
+  n_low_access_dimensions
+)
+
+print(case_dose_response)
+```
+
+```{r main-dose-response-plot}
+
+p_main <- ggplot(
+  case_data,
+  aes(
+    x = n_low_access_dimensions,
+    y = inactive_rate,
+    fill = n_low_access_dimensions
+  )
+) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.size = 1.2,
+    outlier.shape = 16
+  ) +
+  scale_fill_viridis_d(
+    option = "plasma",
+    direction = -1,
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    labels = percent_format()
+  ) +
+  labs(
+    title = "Economic Inactivity by Number of Low-Accessibility Dimensions",
+    subtitle = "County Durham, UN1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Economic inactivity rate",
+    caption = paste0(
+    "Boxplot guide:  — Median    □ Middle 50% of values\n",
+    "| Whiskers: values within 1.5 × IQR    ● Outliers: values beyond 1.5 × IQR"
+    )
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.caption = element_text(
+      hjust = 0,
+      size = 10,
+      margin = margin(t = 10)
+    )
+  )
+
+p_main
+
+ggsave(
+  "data/processed/county_durham_dose_response_boxplot.png",
+  plot = p_main,
+  width = 10,
+  height = 6.5,
+  dpi = 300
+)
+```
+
+
+### National vs County Durham trend comparison
+
+```{r national-county-durham-comparison}
+
+# National mean economic inactivity for each low-accessibility count
+national_dose_response <- summarise_dose_response(
+  un1_analytic,
+  n_low_access_dimensions
+)
+
+# Combine national and County Durham summaries
+trend_comparison <- bind_rows(
+  national_dose_response %>%
+    mutate(area = "National UN1 sample"),
+  
+  case_dose_response %>%
+    mutate(area = "County Durham")
+) %>%
+  mutate(
+    n_dimensions = as.numeric(as.character(n_low_access_dimensions))
+  )
+
+print(trend_comparison)
+
+# Plot
+ggplot(
+  trend_comparison,
+  aes(
+    x = n_dimensions,
+    y = mean_inactivity,
+    group = area,
+    linetype = area,
+    shape = area
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = percent(mean_inactivity, accuracy = 0.01)),
+    vjust = -0.8,
+    size = 3.5,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    breaks = 0:3
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0.35, 0.52)
+  ) +
+  labs(
+    title = "Mean Economic Inactivity by Number of Low-accessibility Dimensions",
+    subtitle = "Urban England and County Durham, UN1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Mean economic inactivity rate",
+    linetype = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(
+  "data/processed/national_county_durham_trend_comparison.png",
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+```{r main-models}
+case_trend_model <- lm(
+  inactive_rate ~ n_low_access_dimensions_num,
+  data = case_data
+)
+
+case_adjusted_data <- case_data %>%
+  drop_na(deprivation_score)
+
+case_adjusted_model <- lm(
+  inactive_rate ~ n_low_access_dimensions_num + deprivation_score,
+  data = case_adjusted_data
+)
+
+cat("Unadjusted model n:", nobs(case_trend_model), "\n")
+print(summary(case_trend_model))
+
+cat("\nDeprivation-adjusted model n:", nobs(case_adjusted_model), "\n")
+print(summary(case_adjusted_model))
+```
+
+## 5. UN1 + UF1 sensitivity analysis
+
+```{r sensitivity-data}
+case_data_sens <- un1_uf1_analytic %>%
+  filter(la_name == selected_case_las)
+
+stopifnot(nrow(case_data_sens) > 0)
+
+case_dose_response_sens <- summarise_dose_response(
+  case_data_sens,
+  n_low_access_dimensions_sens
+)
+
+print(case_dose_response_sens)
+```
+
+```{r sensitivity-models}
+case_trend_model_sens <- lm(
+  inactive_rate ~ n_low_access_dimensions_sens_num,
+  data = case_data_sens
+)
+
+case_adjusted_data_sens <- case_data_sens %>%
+  drop_na(deprivation_score)
+
+case_adjusted_model_sens <- lm(
+  inactive_rate ~
+    n_low_access_dimensions_sens_num +
+    deprivation_score,
+  data = case_adjusted_data_sens
+)
+
+cat("Sensitivity unadjusted model n:", nobs(case_trend_model_sens), "\n")
+print(summary(case_trend_model_sens))
+
+cat("\nSensitivity adjusted model n:", nobs(case_adjusted_model_sens), "\n")
+print(summary(case_adjusted_model_sens))
+```
+
+```{r sensitivity-plot}
+ggplot(
+  case_data_sens,
+  aes(
+    x = n_low_access_dimensions_sens,
+    y = inactive_rate,
+    fill = n_low_access_dimensions_sens
+  )
+) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.size = 0.7,
+    width = 0.75
+  ) +
+
+  # Mean
+  stat_summary(
+    fun.data = function(y) {
+      m <- mean(y, na.rm = TRUE)
+      data.frame(
+        y = m,
+        ymin = m,
+        ymax = m
+      )
+    },
+    geom = "crossbar",
+    width = 0.74,
+    colour = "red",
+    linewidth = 0.5
+  ) +
+
+  scale_fill_viridis_d(option = "plasma", direction = -1, guide = "none") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Sensitivity Analysis: Economic Inactivity by Low-accessibility Dimensions",
+    subtitle = "County Durham, UN1 + UF1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Economic inactivity rate",
+    caption = paste0(
+      "Boxplot guide: black line = median; red line = mean; box = middle 50% of values\n",
+      "Whiskers = values within 1.5 × IQR; points = values beyond 1.5 × IQR"
+    )
+  ) +
+  theme_minimal(base_size = 13)
+
+ggsave(
+  "data/processed/county_durham_sensitivity_boxplot.png",
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+case_student_summary <- case_data %>%
+  group_by(n_low_access_dimensions) %>%
+  summarise(
+    n = n(),
+    mean_student_rate = mean(inactive_student_rate, na.rm = TRUE),
+    median_student_rate = median(inactive_student_rate, na.rm = TRUE),
+    mean_student_share = mean(student_share_of_inactive, na.rm = TRUE),
+    median_student_share = median(student_share_of_inactive, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(case_student_summary)
+
+case_data <- case_data %>%
+  mutate(
+    nonstudent_inactive_rate =
+      inactive_rate - inactive_student_rate
+  )
+
+case_inactivity_decomposition <- case_data %>%
+  group_by(n_low_access_dimensions) %>%
+  summarise(
+    n = n(),
+    mean_total_inactivity =
+      mean(inactive_rate, na.rm = TRUE),
+    mean_student_inactivity =
+      mean(inactive_student_rate, na.rm = TRUE),
+    mean_nonstudent_inactivity =
+      mean(nonstudent_inactive_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(case_inactivity_decomposition)
+
+case_comparison_plot <- case_inactivity_decomposition %>%
+  transmute(
+    n_low_access_dimensions,
+    `Total economic inactivity` = mean_total_inactivity,
+    `Inactivity excluding student component` = mean_nonstudent_inactivity
+  ) %>%
+  pivot_longer(
+    cols = -n_low_access_dimensions,
+    names_to = "measure",
+    values_to = "rate"
+  )
+
+p_composition <- ggplot(
+  case_comparison_plot,
+  aes(
+    x = as.numeric(as.character(n_low_access_dimensions)),
+    y = rate,
+    group = measure,
+    linetype = measure,
+    shape = measure
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = scales::percent(rate, accuracy = 0.1)),
+    vjust = -0.8,
+    size = 3.7,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    breaks = 0:3
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0.33, 0.54)
+  ) +
+  labs(
+    title = "Economic Inactivity Before and After Removing the Student Component",
+    subtitle = "County Durham, UN1 complete-case LSOAs",
+    x = "Number of low-accessibility dimensions",
+    y = "Mean economic inactivity rate",
+    linetype = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+p_composition
+
+ggsave(
+  "data/processed/county_durham_student_composition_line.png",
+  p_composition,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+## 7. Save outputs
+
+```{r save}
+saveRDS(case_data, "data/processed/case_data.rds")
+saveRDS(case_map, "data/processed/case_map.rds")
+saveRDS(case_boundary, "data/processed/case_boundary.rds")
+saveRDS(case_data_sens, "data/processed/case_data_sens.rds")
+saveRDS(case_dose_response, "data/processed/case_dose_response.rds")
+saveRDS(case_dose_response_sens, "data/processed/case_dose_response_sens.rds")
+saveRDS(case_trend_model, "data/processed/case_trend_model.rds")
+saveRDS(case_adjusted_model, "data/processed/case_adjusted_model.rds")
+saveRDS(case_trend_model_sens, "data/processed/case_trend_model_sens.rds")
+saveRDS(case_adjusted_model_sens, "data/processed/case_adjusted_model_sens.rds")
+
+cat("County Durham Phase 2 outputs saved.\n")
+```
